@@ -37,6 +37,8 @@ public class UdpCom implements PacketSender, Runnable {
     private final AtomicLong txSuccess = new AtomicLong();
     private final AtomicLong txErrors = new AtomicLong();
     private final AtomicLong txSuspended = new AtomicLong();
+    private final AtomicLong txStaleLocalSocket = new AtomicLong();
+    private final AtomicLong txStalePublicRemap = new AtomicLong();
     private final AtomicLong rxPackets = new AtomicLong();
     private final AtomicLong rxErrors = new AtomicLong();
 
@@ -81,6 +83,8 @@ public class UdpCom implements PacketSender, Runnable {
                 + " txSuccess=" + this.txSuccess.get()
                 + " txErrors=" + this.txErrors.get()
                 + " txSuspended=" + this.txSuspended.get()
+                + " txStaleLocalSocket=" + this.txStaleLocalSocket.get()
+                + " txStalePublicRemap=" + this.txStalePublicRemap.get()
                 + " rxPackets=" + this.rxPackets.get()
                 + " rxErrors=" + this.rxErrors.get());
     }
@@ -96,11 +100,34 @@ public class UdpCom implements PacketSender, Runnable {
         }
     }
 
+    private static boolean isLocalOnlyDestination(InetSocketAddress address) {
+        if (address == null || address.getAddress() == null) {
+            return false;
+        }
+        return address.getAddress().isAnyLocalAddress()
+                || address.getAddress().isLoopbackAddress()
+                || address.getAddress().isLinkLocalAddress()
+                || address.getAddress().isSiteLocalAddress();
+    }
+
     @Override
-    public int onSendPacketRequested(long j, InetSocketAddress inetSocketAddress, byte[] bArr, int i) {
+    public int onSendPacketRequested(long localSocket, InetSocketAddress inetSocketAddress, byte[] bArr, int i) {
         TxState state = this.txState;
         DatagramSocket socket = state.socket;
         this.txAttempts.incrementAndGet();
+        if (localSocket > 0 && localSocket != state.generation) {
+            if (isLocalOnlyDestination(inetSocketAddress)) {
+                this.txStaleLocalSocket.incrementAndGet();
+                Log.w(TAG, "UDP TX rejected stale local path localSocket=" + localSocket
+                        + " currentGeneration=" + state.generation
+                        + " destination=" + inetSocketAddress);
+                return -1;
+            }
+            this.txStalePublicRemap.incrementAndGet();
+            Log.i(TAG, "UDP TX remapping stale public path localSocket=" + localSocket
+                    + " currentGeneration=" + state.generation
+                    + " destination=" + inetSocketAddress);
+        }
         if (socket == null || socket.isClosed()) {
             this.txSuspended.incrementAndGet();
             return -1;
@@ -110,7 +137,8 @@ public class UdpCom implements PacketSender, Runnable {
             socket.send(datagramPacket);
             this.txSuccess.incrementAndGet();
             DebugLog.d(TAG, "onSendPacketRequested: Sent " + datagramPacket.getLength()
-                    + " bytes to " + inetSocketAddress + " generation=" + state.generation);
+                    + " bytes to " + inetSocketAddress
+                    + " generation=" + state.generation + " localSocket=" + localSocket);
             return 0;
         } catch (Exception e) {
             this.txErrors.incrementAndGet();
@@ -159,7 +187,7 @@ public class UdpCom implements PacketSender, Runnable {
                         DebugLog.d(TAG, "Got " + packet.getLength() + " Bytes From: "
                                 + packet.getAddress() + ":" + packet.getPort()
                                 + " generation=" + generation);
-                        ResultCode result = this.node.processWirePacket(System.currentTimeMillis(), -1,
+                        ResultCode result = this.node.processWirePacket(System.currentTimeMillis(), generation,
                                 new InetSocketAddress(packet.getAddress(), packet.getPort()), payload, deadline);
                         if (result != ResultCode.RESULT_OK) {
                             Log.e(TAG, "processWirePacket returned: " + result);
