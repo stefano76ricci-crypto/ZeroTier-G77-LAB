@@ -29,6 +29,7 @@ import androidx.activity.result.contract.ActivityResultContracts;
 import androidx.annotation.NonNull;
 import androidx.appcompat.widget.SwitchCompat;
 import androidx.core.app.NotificationManagerCompat;
+import androidx.core.content.ContextCompat;
 import androidx.fragment.app.Fragment;
 import androidx.lifecycle.ViewModelProvider;
 import androidx.recyclerview.widget.RecyclerView;
@@ -489,7 +490,7 @@ public class NetworkListFragment extends Fragment {
         var intent = new Intent(requireActivity(), ZeroTierOneService.class);
         intent.putExtra(ZeroTierOneService.ZT1_NETWORK_ID, networkId);
         doBindService();
-        requireActivity().startService(intent);
+        ContextCompat.startForegroundService(requireContext(), intent);
     }
 
     /**

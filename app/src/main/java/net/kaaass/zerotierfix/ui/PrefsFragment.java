@@ -18,6 +18,7 @@ import android.widget.Toast;
 import androidx.activity.result.ActivityResultLauncher;
 import androidx.activity.result.contract.ActivityResultContracts;
 import androidx.annotation.NonNull;
+import androidx.core.content.ContextCompat;
 import androidx.preference.Preference;
 import androidx.preference.PreferenceFragmentCompat;
 import androidx.preference.SwitchPreference;
@@ -260,7 +261,7 @@ public class PrefsFragment extends PreferenceFragmentCompat implements SharedPre
         if (key.equals(Constants.PREF_NETWORK_USE_CELLULAR_DATA)) {
             // 移动网络数据配置
             if (sharedPreferences.getBoolean(Constants.PREF_NETWORK_USE_CELLULAR_DATA, false)) {
-                requireActivity().startService(new Intent(getActivity(), ZeroTierOneService.class));
+                ContextCompat.startForegroundService(requireContext(), new Intent(getActivity(), ZeroTierOneService.class));
             }
         }
     }

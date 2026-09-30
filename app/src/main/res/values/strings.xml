@@ -1,5 +1,5 @@
 <resources>
-    <string name="app_name">Zerotier Fix</string>
+    <string name="app_name">ZeroTier G77 LAB</string>
 
     <string name="button_connect">Connect</string>
     <string name="button_disconnect">Disconnect</string>
@@ -137,6 +137,8 @@
     <string name="cached_moon_file_delete">Cached moon file deleted. Reconnect for this setting to take effect.</string>
     <string name="channel_name">Connection Status Notify</string>
     <string name="channel_description">Connection Status</string>
+    <string name="notification_title_starting">Starting</string>
+    <string name="notification_text_starting">Preparing ZeroTier connection</string>
     <string name="notification_title_connected">Connected</string>
     <string name="notification_text_connected">Connected to: %1$s</string>
     <string name="toast_vpn_application_not_prepared">VPN application is not prepared or is revoked.</string>

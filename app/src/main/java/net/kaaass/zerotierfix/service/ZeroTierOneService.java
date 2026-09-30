@@ -259,6 +259,42 @@ public class ZeroTierOneService extends VpnService implements Runnable, EventLis
         }
     }
 
+    private void startForegroundNotification() {
+        if (this.notificationManager == null) {
+            this.notificationManager =
+                    (NotificationManager) getSystemService(Context.NOTIFICATION_SERVICE);
+        }
+        if (Build.VERSION.SDK_INT >= 26) {
+            String channelName = getString(R.string.channel_name);
+            String description = getString(R.string.channel_description);
+            var channel = new NotificationChannel(
+                    Constants.CHANNEL_ID, channelName, NotificationManager.IMPORTANCE_HIGH);
+            channel.setDescription(description);
+            this.notificationManager.createNotificationChannel(channel);
+        }
+        int pendingIntentFlag = PendingIntent.FLAG_UPDATE_CURRENT;
+        if (Build.VERSION.SDK_INT >= 31) {
+            pendingIntentFlag |= PendingIntent.FLAG_IMMUTABLE;
+        }
+        var pendingIntent = PendingIntent.getActivity(
+                this, 0,
+                new Intent(this, NetworkListActivity.class)
+                        .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK
+                                | Intent.FLAG_ACTIVITY_SINGLE_TOP
+                                | Intent.FLAG_ACTIVITY_CLEAR_TOP),
+                pendingIntentFlag);
+        var notification = new NotificationCompat.Builder(this, Constants.CHANNEL_ID)
+                .setPriority(1)
+                .setOngoing(true)
+                .setSmallIcon(R.mipmap.ic_launcher)
+                .setContentTitle(getString(R.string.notification_title_starting))
+                .setContentText(getString(R.string.notification_text_starting))
+                .setColor(ContextCompat.getColor(getApplicationContext(), R.color.zerotier_orange))
+                .setContentIntent(pendingIntent)
+                .build();
+        startForeground(ZT_NOTIFICATION_TAG, notification);
+    }
+
     /**
      * 启动 ZT 服务，连接至给定网络或最近连接的网络
      */
@@ -273,6 +309,7 @@ public class ZeroTierOneService extends VpnService implements Runnable, EventLis
             Log.e(TAG, "NULL intent.  Cannot start");
             return START_NOT_STICKY;
         }
+        startForegroundNotification();
         this.mStartID = startId;
 
         // 注册事件总线监听器
@@ -482,6 +519,7 @@ public class ZeroTierOneService extends VpnService implements Runnable, EventLis
         if (this.eventBus.isRegistered(this)) {
             this.eventBus.unregister(this);
         }
+        stopForeground(true);
         if (this.notificationManager != null) {
             this.notificationManager.cancel(ZT_NOTIFICATION_TAG);
         }
