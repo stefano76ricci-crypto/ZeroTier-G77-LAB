@@ -1,0 +1,88 @@
+diff --git a/node/Node.cpp b/node/Node.cpp
+index f704ff09a..884cfe3dc 100644
+--- a/node/Node.cpp
++++ b/node/Node.cpp
+@@ -19,6 +19,7 @@
+ #include "NetworkController.hpp"
+ #include "Packet.hpp"
+ #include "PacketMultiplexer.hpp"
++#include "Peer.hpp"
+ #include "RuntimeEnvironment.hpp"
+ #include "SelfAwareness.hpp"
+ #include "SharedPtr.hpp"
+@@ -39,6 +40,29 @@
+ 
+ namespace ZeroTier {
+ 
++// LAB Android bridge: a positive localSocket is the monotonic UDP socket
++// generation.  When a newer generation first receives traffic, the physical
++// transport has changed and paths learned on the previous transport must not
++// remain eligible until the normal 243s peer-path expiration.
++class _ResetIPv4PhysicalPathsOnSocketChange {
++  public:
++    _ResetIPv4PhysicalPathsOnSocketChange(void* tPtr, int64_t now) : _tPtr(tPtr), _now(now)
++    {
++    }
++
++    inline void operator()(Topology& t, const SharedPtr<Peer>& p)
++    {
++        for (int scope = (int)InetAddress::IP_SCOPE_PSEUDOPRIVATE;
++             scope <= (int)InetAddress::IP_SCOPE_PRIVATE; ++scope) {
++            p->resetWithinScope(_tPtr, (InetAddress::IpScope)scope, AF_INET, _now);
++        }
++    }
++
++  private:
++    void* _tPtr;
++    int64_t _now;
++};
++
+ /****************************************************************************/
+ /* Public Node interface (C++, exposed via CAPI bindings)                   */
+ /****************************************************************************/
+@@ -53,6 +77,7 @@ Node::Node(void* uptr, void* tptr, const struct ZT_Node_Config* config, const st
+ 	, _lastGratuitousPingCheck(0)
+ 	, _lastHousekeepingRun(0)
+ 	, _lastMemoizedTraceSettings(0)
++	, _lastPositiveLocalSocket(-1)
+ 	, _lowBandwidthMode(false)
+ {
+ 	if (callbacks->version != 0) {
+@@ -207,6 +232,24 @@ Node::~Node()
+ ZT_ResultCode Node::processWirePacket(void* tptr, int64_t now, int64_t localSocket, const struct sockaddr_storage* remoteAddress, const void* packetData, unsigned int packetLength, volatile int64_t* nextBackgroundTaskDeadline)
+ {
+ 	_now = now;
++
++	bool resetPhysicalPaths = false;
++	if (localSocket > 0) {
++		Mutex::Lock _l(_localSocketGeneration_m);
++		if (_lastPositiveLocalSocket <= 0) {
++			_lastPositiveLocalSocket = localSocket;
++		}
++		else if (localSocket > _lastPositiveLocalSocket) {
++			_lastPositiveLocalSocket = localSocket;
++			resetPhysicalPaths = true;
++		}
++	}
++
++	if (resetPhysicalPaths) {
++		_ResetIPv4PhysicalPathsOnSocketChange resetter(tptr, now);
++		RR->topology->eachPeer<_ResetIPv4PhysicalPathsOnSocketChange&>(resetter);
++	}
++
+ 	RR->sw->onRemotePacket(tptr, localSocket, *(reinterpret_cast<const InetAddress*>(remoteAddress)), packetData, packetLength);
+ 	return ZT_RESULT_OK;
+ }
+diff --git a/node/Node.hpp b/node/Node.hpp
+index 8ea09f551..eed9ed0f0 100644
+--- a/node/Node.hpp
++++ b/node/Node.hpp
+@@ -358,6 +358,8 @@ class Node : public NetworkController::Sender {
+ 	int64_t _lastGratuitousPingCheck;
+ 	int64_t _lastHousekeepingRun;
+ 	int64_t _lastMemoizedTraceSettings;
++	int64_t _lastPositiveLocalSocket;
++	Mutex _localSocketGeneration_m;
+ 	volatile int64_t _prngState[2];
+ 	bool _online;
+ 	bool _lowBandwidthMode;
