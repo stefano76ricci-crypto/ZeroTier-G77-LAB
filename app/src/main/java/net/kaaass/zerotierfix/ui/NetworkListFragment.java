@@ -52,6 +52,8 @@ import net.kaaass.zerotierfix.events.NodeIDEvent;
 import net.kaaass.zerotierfix.events.NodeStatusEvent;
 import net.kaaass.zerotierfix.events.NodeStatusRequestEvent;
 import net.kaaass.zerotierfix.events.OrbitMoonEvent;
+import net.kaaass.zerotierfix.events.RefreshUdpRequestedEvent;
+import net.kaaass.zerotierfix.events.RefreshUdpResultEvent;
 import net.kaaass.zerotierfix.events.StopEvent;
 import net.kaaass.zerotierfix.events.VPNErrorEvent;
 import net.kaaass.zerotierfix.events.VirtualNetworkConfigChangedEvent;
@@ -326,8 +328,21 @@ public class NetworkListFragment extends Fragment {
             Log.d(TAG, "Selected orbit");
             startActivity(new Intent(getActivity(), MoonOrbitActivity.class));
             return true;
+        } else if (menuId == R.id.menu_item_diag_refresh_udp) {
+            Log.d(TAG, "Selected diagnostic UDP refresh");
+            Toast.makeText(requireContext(), R.string.diag_udp_refresh_requested, Toast.LENGTH_SHORT).show();
+            this.eventBus.post(new RefreshUdpRequestedEvent());
+            return true;
         }
         return super.onOptionsItemSelected(menuItem);
+    }
+
+    @Subscribe(threadMode = ThreadMode.MAIN)
+    public void onRefreshUdpResult(RefreshUdpResultEvent event) {
+        Context context = getContext();
+        if (context != null) {
+            Toast.makeText(context, event.getMessage(), Toast.LENGTH_LONG).show();
+        }
     }
 
     @Override

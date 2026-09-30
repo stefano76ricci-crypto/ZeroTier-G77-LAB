@@ -7,6 +7,9 @@
         android:id="@+id/menu_item_orbit"
         android:title="@string/menu_orbit" />
     <item
+        android:id="@+id/menu_item_diag_refresh_udp"
+        android:title="@string/diag_udp_refresh" />
+    <item
         android:id="@+id/menu_item_settings"
         android:title="@string/settings" />
 </menu>

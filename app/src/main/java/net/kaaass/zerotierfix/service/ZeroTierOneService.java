@@ -10,6 +10,7 @@ import android.os.Binder;
 import android.os.Build;
 import android.os.IBinder;
 import android.os.ParcelFileDescriptor;
+import android.os.SystemClock;
 import android.preference.PreferenceManager;
 import android.util.Log;
 import android.widget.Toast;
@@ -44,6 +45,8 @@ import net.kaaass.zerotierfix.events.NodeStatusRequestEvent;
 import net.kaaass.zerotierfix.events.OrbitMoonEvent;
 import net.kaaass.zerotierfix.events.PeerInfoReplyEvent;
 import net.kaaass.zerotierfix.events.PeerInfoRequestEvent;
+import net.kaaass.zerotierfix.events.RefreshUdpRequestedEvent;
+import net.kaaass.zerotierfix.events.RefreshUdpResultEvent;
 import net.kaaass.zerotierfix.events.StopEvent;
 import net.kaaass.zerotierfix.events.VPNErrorEvent;
 import net.kaaass.zerotierfix.events.VirtualNetworkConfigChangedEvent;
@@ -77,6 +80,8 @@ import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.locks.ReentrantReadWriteLock;
 
 // TODO: clear up
@@ -106,6 +111,19 @@ public class ZeroTierOneService extends VpnService implements Runnable, EventLis
     private TunTapAdapter tunTapAdapter;
     private UdpCom udpCom;
     private Thread udpThread;
+    private long udpTransportEpoch = 0;
+    private long udpSocketGeneration = 1;
+    private long udpRefreshRequestCounter = 0;
+    private boolean udpRefreshInProgress = false;
+    private boolean udpStopping = false;
+    private boolean serviceTeardownInProgress = false;
+
+    private enum ReplacementResult {
+        INSTALLED,
+        FAILED,
+        LIFECYCLE_CHANGED,
+        UNSAFE_TO_RECOVER
+    }
     private Thread v4MulticastScanner = new Thread() {
         /* class com.zerotier.one.service.ZeroTierOneService.AnonymousClass1 */
         List<String> subscriptions = new ArrayList<>();
@@ -376,6 +394,10 @@ public class ZeroTierOneService extends VpnService implements Runnable, EventLis
         // 启动 ZT 服务
         synchronized (this) {
             try {
+                if (this.udpStopping || this.serviceTeardownInProgress) {
+                    Log.w(TAG, "ZeroTier start rejected while transport teardown is in progress");
+                    return START_NOT_STICKY;
+                }
                 // 创建本地 ZT 服务 Socket，监听本地端口
                 if (this.svrSocket == null) {
                     this.svrSocket = new DatagramSocket(null);
@@ -389,6 +411,12 @@ public class ZeroTierOneService extends VpnService implements Runnable, EventLis
 
                 // 创建本地节点
                 if (this.node == null) {
+                    synchronized (this) {
+                        this.udpTransportEpoch++;
+                        this.udpSocketGeneration = 1;
+                        this.udpRefreshInProgress = false;
+                        this.udpStopping = false;
+                    }
                     this.udpCom = new UdpCom(this, this.svrSocket);
                     this.tunTapAdapter = new TunTapAdapter(this, networkId);
 
@@ -433,7 +461,9 @@ public class ZeroTierOneService extends VpnService implements Runnable, EventLis
                     this.tunTapAdapter.setNode(this.node);
 
                     // 启动 UDP 消息处理线程
-                    var thread = new Thread(this.udpCom, "UDP Communication Thread");
+                    var thread = new Thread(
+                            this.udpCom.receiverRunnable(this.svrSocket, this.udpSocketGeneration, null, null),
+                            "UDP Communication Thread gen=" + this.udpSocketGeneration);
                     this.udpThread = thread;
                     thread.start();
                 }
@@ -458,18 +488,337 @@ public class ZeroTierOneService extends VpnService implements Runnable, EventLis
         return START_STICKY;
     }
 
-    public void stopZeroTier() {
-        if (this.svrSocket != null) {
-            this.svrSocket.close();
-            this.svrSocket = null;
-        }
-        if (this.udpThread != null && this.udpThread.isAlive()) {
-            this.udpThread.interrupt();
-            try {
-                this.udpThread.join();
-            } catch (InterruptedException ignored) {
+    private DatagramSocket prepareProtectedUdpSocket(long requestId, String phase) throws Exception {
+        long started = SystemClock.elapsedRealtime();
+        DatagramSocket socket = new DatagramSocket(null);
+        try {
+            socket.setReuseAddress(true);
+            socket.setSoTimeout(1000);
+            boolean protectedOk = protect(socket);
+            Log.i(TAG, "C1_UDP request=" + requestId + " phase=" + phase
+                    + " protect=" + protectedOk + " elapsedMs="
+                    + (SystemClock.elapsedRealtime() - started));
+            if (!protectedOk) {
+                throw new IllegalStateException("protect(candidate UDP socket) returned false");
             }
+            return socket;
+        } catch (Exception e) {
+            socket.close();
+            throw e;
+        }
+    }
+
+    private boolean closeCandidateTransport(DatagramSocket socket, Thread thread) {
+        if (socket != null) {
+            socket.close();
+        }
+        if (thread != null && thread.isAlive()) {
+            thread.interrupt();
+            if (thread != Thread.currentThread()) {
+                try {
+                    thread.join(1500);
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                }
+            }
+        }
+        return thread == null || !thread.isAlive();
+    }
+
+    private ReplacementResult installUdpReplacement(long requestId, DatagramSocket candidate,
+                                                     long generation, long expectedEpoch,
+                                                     Node expectedNode, UdpCom expectedUdpCom,
+                                                     String phase) {
+        Thread candidateThread = null;
+        CountDownLatch publishGate = new CountDownLatch(1);
+        CountDownLatch readyLatch = new CountDownLatch(1);
+        try {
+            long bindStarted = SystemClock.elapsedRealtime();
+            candidate.bind(new InetSocketAddress(9994));
+            if (candidate.getLocalPort() != 9994) {
+                throw new IllegalStateException("candidate UDP socket did not bind port 9994");
+            }
+            Log.i(TAG, "C1_UDP request=" + requestId + " phase=" + phase
+                    + " bound=" + candidate.getLocalSocketAddress() + " elapsedMs="
+                    + (SystemClock.elapsedRealtime() - bindStarted));
+
+            candidateThread = new Thread(
+                    expectedUdpCom.receiverRunnable(candidate, generation, publishGate, readyLatch),
+                    "UDP Communication Thread gen=" + generation);
+            candidateThread.start();
+
+            boolean published = false;
+            synchronized (this) {
+                if (this.udpTransportEpoch == expectedEpoch && !this.udpStopping
+                        && this.node == expectedNode && this.udpCom == expectedUdpCom) {
+                    this.svrSocket = candidate;
+                    this.udpThread = candidateThread;
+                    this.udpSocketGeneration = generation;
+                    expectedUdpCom.installTxSocket(candidate, generation);
+                    published = true;
+                }
+            }
+            if (!published) {
+                boolean terminated = closeCandidateTransport(candidate, candidateThread);
+                return terminated ? ReplacementResult.LIFECYCLE_CHANGED
+                        : ReplacementResult.UNSAFE_TO_RECOVER;
+            }
+
+            publishGate.countDown();
+            boolean ready = readyLatch.await(1500, TimeUnit.MILLISECONDS);
+            if (!ready || !candidateThread.isAlive()) {
+                boolean stillOwned;
+                synchronized (this) {
+                    stillOwned = this.udpTransportEpoch == expectedEpoch && !this.udpStopping
+                            && this.node == expectedNode && this.udpCom == expectedUdpCom
+                            && this.svrSocket == candidate && this.udpThread == candidateThread;
+                    if (stillOwned) {
+                        expectedUdpCom.suspendTx(candidate, generation);
+                        this.svrSocket = null;
+                        this.udpThread = null;
+                    }
+                }
+                boolean terminated = closeCandidateTransport(candidate, candidateThread);
+                Log.e(TAG, "C1_UDP request=" + requestId + " phase=" + phase
+                        + " RX readiness failed terminated=" + terminated);
+                if (!stillOwned) {
+                    return ReplacementResult.LIFECYCLE_CHANGED;
+                }
+                return terminated ? ReplacementResult.FAILED : ReplacementResult.UNSAFE_TO_RECOVER;
+            }
+
+            synchronized (this) {
+                if (this.udpTransportEpoch != expectedEpoch || this.udpStopping
+                        || this.node != expectedNode || this.udpCom != expectedUdpCom
+                        || this.svrSocket != candidate || this.udpThread != candidateThread) {
+                    return ReplacementResult.LIFECYCLE_CHANGED;
+                }
+                this.udpRefreshInProgress = false;
+            }
+            Log.i(TAG, "C1_UDP request=" + requestId + " phase=" + phase
+                    + " installed generation=" + generation
+                    + " nodeIdentity=" + System.identityHashCode(expectedNode)
+                    + " tunIdentity=" + System.identityHashCode(this.tunTapAdapter));
+            expectedUdpCom.logStats("c1_" + phase + "_installed");
+            return ReplacementResult.INSTALLED;
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            boolean terminated = closeCandidateTransport(candidate, candidateThread);
+            Log.e(TAG, "C1_UDP request=" + requestId + " phase=" + phase
+                    + " interrupted terminated=" + terminated, e);
+            return terminated ? ReplacementResult.FAILED : ReplacementResult.UNSAFE_TO_RECOVER;
+        } catch (Exception e) {
+            boolean terminated = closeCandidateTransport(candidate, candidateThread);
+            Log.e(TAG, "C1_UDP request=" + requestId + " phase=" + phase
+                    + " failed terminated=" + terminated, e);
+            return terminated ? ReplacementResult.FAILED : ReplacementResult.UNSAFE_TO_RECOVER;
+        }
+    }
+
+    private void clearUdpRefreshFlag(long expectedEpoch, Node expectedNode, UdpCom expectedUdpCom) {
+        synchronized (this) {
+            if (this.udpTransportEpoch == expectedEpoch
+                    && this.node == expectedNode && this.udpCom == expectedUdpCom) {
+                this.udpRefreshInProgress = false;
+            }
+        }
+    }
+
+    private void failUdpRefreshAndStop(long requestId, long expectedEpoch,
+                                       Node expectedNode, UdpCom expectedUdpCom, String reason) {
+        boolean claimedStop = false;
+        synchronized (this) {
+            if (this.udpTransportEpoch == expectedEpoch && !this.udpStopping
+                    && !this.serviceTeardownInProgress
+                    && this.node == expectedNode && this.udpCom == expectedUdpCom) {
+                this.serviceTeardownInProgress = true;
+                this.udpStopping = true;
+                this.udpTransportEpoch++;
+                this.udpRefreshInProgress = false;
+                claimedStop = true;
+            }
+        }
+        Log.e(TAG, "C1_UDP request=" + requestId + " fatal=" + reason
+                + " claimedStop=" + claimedStop);
+        this.eventBus.post(new RefreshUdpResultEvent(false, claimedStop
+                ? "UDP refresh failed; service is stopping: " + reason
+                : "UDP refresh cancelled by lifecycle change: " + reason));
+        if (claimedStop) {
+            performZeroTierTeardown();
+        }
+    }
+
+    private void refreshUdpSocketForDiagnostics() {
+        final long requestId;
+        final long expectedEpoch;
+        final long oldGeneration;
+        final DatagramSocket oldSocket;
+        final Thread oldThread;
+        final Node expectedNode;
+        final UdpCom expectedUdpCom;
+
+        synchronized (this) {
+            if (this.udpStopping || this.udpRefreshInProgress || this.node == null
+                    || this.udpCom == null || this.svrSocket == null || this.udpThread == null
+                    || !this.udpThread.isAlive()) {
+                this.eventBus.post(new RefreshUdpResultEvent(false,
+                        "UDP refresh rejected: transport is not in a stable running state"));
+                return;
+            }
+            this.udpRefreshInProgress = true;
+            requestId = ++this.udpRefreshRequestCounter;
+            expectedEpoch = this.udpTransportEpoch;
+            oldGeneration = this.udpSocketGeneration;
+            oldSocket = this.svrSocket;
+            oldThread = this.udpThread;
+            expectedNode = this.node;
+            expectedUdpCom = this.udpCom;
+        }
+
+        long refreshStarted = SystemClock.elapsedRealtime();
+        Log.i(TAG, "C1_UDP request=" + requestId + " phase=start epoch=" + expectedEpoch
+                + " generation=" + oldGeneration
+                + " nodeIdentity=" + System.identityHashCode(expectedNode)
+                + " tunIdentity=" + System.identityHashCode(this.tunTapAdapter)
+                + " vpnIdentity=" + System.identityHashCode(this.vpnSocket));
+        expectedUdpCom.logStats("c1_before_refresh");
+
+        DatagramSocket candidate;
+        try {
+            candidate = prepareProtectedUdpSocket(requestId, "prepare");
+        } catch (Exception e) {
+            clearUdpRefreshFlag(expectedEpoch, expectedNode, expectedUdpCom);
+            Log.e(TAG, "C1_UDP request=" + requestId + " prepare failed; old transport retained", e);
+            this.eventBus.post(new RefreshUdpResultEvent(false,
+                    "UDP refresh prepare/protect failed; old transport retained"));
+            return;
+        }
+
+        synchronized (this) {
+            if (this.udpTransportEpoch != expectedEpoch || this.udpStopping
+                    || this.node != expectedNode || this.udpCom != expectedUdpCom
+                    || this.svrSocket != oldSocket || this.udpThread != oldThread) {
+                candidate.close();
+                clearUdpRefreshFlag(expectedEpoch, expectedNode, expectedUdpCom);
+                this.eventBus.post(new RefreshUdpResultEvent(false,
+                        "UDP refresh aborted: service lifecycle changed"));
+                return;
+            }
+            if (!expectedUdpCom.suspendTx(oldSocket, oldGeneration)) {
+                candidate.close();
+                clearUdpRefreshFlag(expectedEpoch, expectedNode, expectedUdpCom);
+                this.eventBus.post(new RefreshUdpResultEvent(false,
+                        "UDP refresh aborted: TX socket changed unexpectedly"));
+                return;
+            }
+        }
+
+        Log.i(TAG, "C1_UDP request=" + requestId + " phase=close_old generation=" + oldGeneration);
+        oldSocket.close();
+        oldThread.interrupt();
+        try {
+            oldThread.join(3000);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            candidate.close();
+            failUdpRefreshAndStop(requestId, expectedEpoch, expectedNode, expectedUdpCom,
+                    "interrupted while waiting for old RX thread");
+            return;
+        }
+        if (oldThread.isAlive()) {
+            candidate.close();
+            failUdpRefreshAndStop(requestId, expectedEpoch, expectedNode, expectedUdpCom,
+                    "old RX thread did not terminate");
+            return;
+        }
+        Log.i(TAG, "C1_UDP request=" + requestId + " phase=old_rx_stopped elapsedMs="
+                + (SystemClock.elapsedRealtime() - refreshStarted));
+
+        long newGeneration = oldGeneration + 1;
+        ReplacementResult result = installUdpReplacement(requestId, candidate, newGeneration,
+                expectedEpoch, expectedNode, expectedUdpCom, "primary");
+        if (result == ReplacementResult.INSTALLED) {
+            this.eventBus.post(new RefreshUdpResultEvent(true,
+                    "UDP transport refreshed (generation " + newGeneration + ")"));
+            return;
+        }
+        if (result == ReplacementResult.LIFECYCLE_CHANGED) {
+            clearUdpRefreshFlag(expectedEpoch, expectedNode, expectedUdpCom);
+            this.eventBus.post(new RefreshUdpResultEvent(false,
+                    "UDP refresh aborted: service lifecycle changed"));
+            return;
+        }
+        if (result == ReplacementResult.UNSAFE_TO_RECOVER) {
+            failUdpRefreshAndStop(requestId, expectedEpoch, expectedNode, expectedUdpCom,
+                    "candidate RX thread did not terminate safely");
+            return;
+        }
+
+        Log.w(TAG, "C1_UDP request=" + requestId + " primary replacement failed; trying recovery");
+        DatagramSocket recoveryCandidate;
+        try {
+            recoveryCandidate = prepareProtectedUdpSocket(requestId, "recovery_prepare");
+        } catch (Exception e) {
+            failUdpRefreshAndStop(requestId, expectedEpoch, expectedNode, expectedUdpCom,
+                    "recovery prepare/protect failed");
+            return;
+        }
+        ReplacementResult recovery = installUdpReplacement(requestId, recoveryCandidate, newGeneration,
+                expectedEpoch, expectedNode, expectedUdpCom, "recovery");
+        if (recovery == ReplacementResult.INSTALLED) {
+            this.eventBus.post(new RefreshUdpResultEvent(false,
+                    "Primary UDP refresh failed, but transport recovery succeeded"));
+        } else if (recovery == ReplacementResult.LIFECYCLE_CHANGED) {
+            clearUdpRefreshFlag(expectedEpoch, expectedNode, expectedUdpCom);
+        } else if (recovery == ReplacementResult.UNSAFE_TO_RECOVER) {
+            failUdpRefreshAndStop(requestId, expectedEpoch, expectedNode, expectedUdpCom,
+                    "recovery RX thread did not terminate safely");
+        } else {
+            failUdpRefreshAndStop(requestId, expectedEpoch, expectedNode, expectedUdpCom,
+                    "replacement and recovery both failed");
+        }
+    }
+
+    public void stopZeroTier() {
+        synchronized (this) {
+            if (this.serviceTeardownInProgress) {
+                return;
+            }
+            this.serviceTeardownInProgress = true;
+            this.udpStopping = true;
+            this.udpTransportEpoch++;
+        }
+        performZeroTierTeardown();
+    }
+
+    private void performZeroTierTeardown() {
+        final DatagramSocket udpSocketToClose;
+        final Thread udpThreadToJoin;
+        final UdpCom udpComToStop;
+        final long udpGenerationToStop;
+        synchronized (this) {
+            udpSocketToClose = this.svrSocket;
+            udpThreadToJoin = this.udpThread;
+            udpComToStop = this.udpCom;
+            udpGenerationToStop = this.udpSocketGeneration;
+            if (udpComToStop != null && udpSocketToClose != null) {
+                udpComToStop.suspendTx(udpSocketToClose, udpGenerationToStop);
+            }
+            this.svrSocket = null;
             this.udpThread = null;
+        }
+        if (udpSocketToClose != null) {
+            udpSocketToClose.close();
+        }
+        if (udpThreadToJoin != null && udpThreadToJoin.isAlive()) {
+            udpThreadToJoin.interrupt();
+            if (udpThreadToJoin != Thread.currentThread()) {
+                try {
+                    udpThreadToJoin.join();
+                } catch (InterruptedException ignored) {
+                    Thread.currentThread().interrupt();
+                }
+            }
         }
         if (this.tunTapAdapter != null && this.tunTapAdapter.isRunning()) {
             this.tunTapAdapter.interrupt();
@@ -525,6 +874,11 @@ public class ZeroTierOneService extends VpnService implements Runnable, EventLis
         }
         if (!stopSelfResult(this.mStartID)) {
             Log.e(TAG, "stopSelfResult() failed!");
+        }
+        synchronized (this) {
+            this.udpRefreshInProgress = false;
+            this.udpStopping = false;
+            this.serviceTeardownInProgress = false;
         }
     }
 
@@ -595,6 +949,11 @@ public class ZeroTierOneService extends VpnService implements Runnable, EventLis
             }
         }
         Log.d(TAG, "ZeroTierOne Service Ended");
+    }
+
+    @Subscribe(threadMode = ThreadMode.ASYNC)
+    public void onRefreshUdpRequested(RefreshUdpRequestedEvent event) {
+        refreshUdpSocketForDiagnostics();
     }
 
     @Subscribe(threadMode = ThreadMode.POSTING)

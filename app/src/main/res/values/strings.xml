@@ -155,4 +155,6 @@
     <string name="dialog_no_notification_alert_title">Notification Permission Not Granted</string>
     <string name="open_notification_settings">Goto notification settings</string>
     <string name="dont_show_again">Don\'t show again</string>
+    <string name="diag_udp_refresh">LAB: Refresh UDP transport</string>
+    <string name="diag_udp_refresh_requested">UDP refresh requested</string>
 </resources>
